@@ -11,6 +11,31 @@ const supportedProviders = ['github', 'gitlab'];
 const escapeRegExp = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /**
+ * Parse the `ALLOWED_DOMAINS` environment variable into a list of domain patterns.
+ * @param {string} [allowedDomains] - Comma-separated domain patterns.
+ * @returns {string[]} Domain patterns, without empty entries.
+ */
+const parseAllowedDomains = (allowedDomains) =>
+  (allowedDomains ?? '')
+    .split(',')
+    .map((str) => str.trim())
+    .filter(Boolean);
+
+/**
+ * Check if a domain matches any of the allowed domain patterns. A `*` in a pattern matches
+ * any number of characters, including dots, mirroring the documented `ALLOWED_DOMAINS`
+ * behavior.
+ * @param {string} domain - Domain to check, such as a site ID or a hostname.
+ * @param {string[]} allowedDomains - Allowed domain patterns.
+ * @returns {boolean} `true` if the domain is allowed.
+ */
+const isAllowedDomain = (domain, allowedDomains) =>
+  allowedDomains.some((pattern) =>
+    // Escape the pattern, then replace a wildcard for regex
+    new RegExp(`^${escapeRegExp(pattern).replace('\\*', '.+')}$`).test(domain),
+  );
+
+/**
  * Output HTML response that communicates with the window opener.
  * @param {object} args - Options.
  * @param {string} [args.provider] - Backend name, e,g. `github`.
@@ -18,25 +43,65 @@ const escapeRegExp = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
  * @param {string} [args.error] - Error message when an OAuth token is not available.
  * @param {string} [args.errorCode] - Error code to be used to localize the error message in
  * Sveltia CMS.
+ * @param {string[]} [args.allowedDomains] - Allowed domain patterns. The result is only ever
+ * sent to a window whose hostname matches one of these patterns; a token is never output
+ * when the list is empty.
  * @returns {Response} Response with HTML.
  */
-const outputHTML = ({ provider = 'unknown', token, error, errorCode }) => {
-  const state = error ? 'error' : 'success';
-  const content = error ? { provider, error, errorCode } : { provider, token };
+const outputHTML = ({ provider = 'unknown', token, error, errorCode, allowedDomains = [] }) => {
+  // Fail closed: without an allow-list there is no window the token may be sent to
+  const misconfigured = Boolean(token) && !allowedDomains.length;
+  const state = error || misconfigured ? 'error' : 'success';
+
+  const content =
+    error || misconfigured
+      ? {
+          provider,
+          error: misconfigured ? 'Allowed domains are not configured on the authenticator.' : error,
+          errorCode: misconfigured ? 'MISCONFIGURED_ALLOWED_DOMAINS' : errorCode,
+        }
+      : { provider, token };
+
+  // Regex sources for the allowed domain patterns, applied to the replying window's hostname
+  const allowedPatterns = allowedDomains.map(
+    (pattern) => `^${escapeRegExp(pattern).replace('\\*', '.+')}$`,
+  );
+
+  // Origins the handshake may be announced to; a wildcard pattern names no single origin,
+  // so only exact domains can be announced to
+  const allowedOrigins = allowedDomains
+    .filter((pattern) => !pattern.includes('*'))
+    .map((pattern) => `https://${pattern}`);
 
   return new Response(
     `
       <!doctype html><html><body><script>
         (() => {
+          const allowedPatterns = ${JSON.stringify(allowedPatterns).replaceAll('<', '\\u003c')};
+          const allowedOrigins = ${JSON.stringify(allowedOrigins).replaceAll('<', '\\u003c')};
+
           window.addEventListener('message', ({ data, origin }) => {
-            if (data === 'authorizing:${provider}') {
+            let hostname = '';
+
+            try {
+              hostname = new URL(origin).hostname;
+            } catch {
+              return;
+            }
+
+            if (
+              data === 'authorizing:${provider}' &&
+              allowedPatterns.some((pattern) => new RegExp(pattern).test(hostname))
+            ) {
               window.opener?.postMessage(
-                'authorization:${provider}:${state}:${JSON.stringify(content)}',
+                'authorization:${provider}:${state}:${JSON.stringify(content).replaceAll('<', '\\u003c')}',
                 origin
               );
             }
           });
-          window.opener?.postMessage('authorizing:${provider}', '*');
+          allowedOrigins.forEach((origin) => {
+            window.opener?.postMessage('authorizing:${provider}', origin);
+          });
         })();
       </script></body></html>
     `,
@@ -60,16 +125,17 @@ const handleAuth = async (request, env) => {
   const { url } = request;
   const { origin, searchParams } = new URL(url);
   const { provider, site_id: domain } = Object.fromEntries(searchParams);
+  const allowedDomains = parseAllowedDomains(env.ALLOWED_DOMAINS);
 
   if (!provider || !supportedProviders.includes(provider)) {
     return outputHTML({
+      allowedDomains,
       error: 'Your Git backend is not supported by the authenticator.',
       errorCode: 'UNSUPPORTED_BACKEND',
     });
   }
 
   const {
-    ALLOWED_DOMAINS,
     GITHUB_CLIENT_ID,
     GITHUB_CLIENT_SECRET,
     GITHUB_HOSTNAME = 'github.com',
@@ -78,16 +144,21 @@ const handleAuth = async (request, env) => {
     GITLAB_HOSTNAME = 'gitlab.com',
   } = env;
 
-  // Check if the domain is whitelisted
-  if (
-    ALLOWED_DOMAINS &&
-    !ALLOWED_DOMAINS.split(/,/).some((str) =>
-      // Escape the input, then replace a wildcard for regex
-      (domain ?? '').match(new RegExp(`^${escapeRegExp(str.trim()).replace('\\*', '.+')}$`)),
-    )
-  ) {
+  // Fail closed when no domain is configured to use the authenticator
+  if (!allowedDomains.length) {
     return outputHTML({
       provider,
+      allowedDomains,
+      error: 'Allowed domains are not configured on the authenticator.',
+      errorCode: 'MISCONFIGURED_ALLOWED_DOMAINS',
+    });
+  }
+
+  // Check if the domain is allowed
+  if (!isAllowedDomain(domain ?? '', allowedDomains)) {
+    return outputHTML({
+      provider,
+      allowedDomains,
       error: 'Your domain is not allowed to use the authenticator.',
       errorCode: 'UNSUPPORTED_DOMAIN',
     });
@@ -101,6 +172,7 @@ const handleAuth = async (request, env) => {
   if (provider === 'github') {
     if (!GITHUB_CLIENT_ID || !GITHUB_CLIENT_SECRET) {
       return outputHTML({
+        allowedDomains,
         provider,
         error: 'OAuth app client ID or secret is not configured.',
         errorCode: 'MISCONFIGURED_CLIENT',
@@ -120,6 +192,7 @@ const handleAuth = async (request, env) => {
   if (provider === 'gitlab') {
     if (!GITLAB_CLIENT_ID || !GITLAB_CLIENT_SECRET) {
       return outputHTML({
+        allowedDomains,
         provider,
         error: 'OAuth app client ID or secret is not configured.',
         errorCode: 'MISCONFIGURED_CLIENT',
@@ -161,12 +234,14 @@ const handleCallback = async (request, env) => {
   const { url, headers } = request;
   const { origin, searchParams } = new URL(url);
   const { code, state } = Object.fromEntries(searchParams);
+  const allowedDomains = parseAllowedDomains(env.ALLOWED_DOMAINS);
 
   const [, provider, csrfToken] =
     headers.get('Cookie')?.match(/\bcsrf-token=([a-z-]+?)_([0-9a-f]{32})\b/) ?? [];
 
   if (!provider || !supportedProviders.includes(provider)) {
     return outputHTML({
+      allowedDomains,
       error: 'Your Git backend is not supported by the authenticator.',
       errorCode: 'UNSUPPORTED_BACKEND',
     });
@@ -174,6 +249,7 @@ const handleCallback = async (request, env) => {
 
   if (!code || !state) {
     return outputHTML({
+      allowedDomains,
       provider,
       error: 'Failed to receive an authorization code. Please try again later.',
       errorCode: 'AUTH_CODE_REQUEST_FAILED',
@@ -182,6 +258,7 @@ const handleCallback = async (request, env) => {
 
   if (!csrfToken || state !== csrfToken) {
     return outputHTML({
+      allowedDomains,
       provider,
       error: 'Potential CSRF attack detected. Authentication flow aborted.',
       errorCode: 'CSRF_DETECTED',
@@ -204,6 +281,7 @@ const handleCallback = async (request, env) => {
   if (provider === 'github') {
     if (!GITHUB_CLIENT_ID || !GITHUB_CLIENT_SECRET) {
       return outputHTML({
+        allowedDomains,
         provider,
         error: 'OAuth app client ID or secret is not configured.',
         errorCode: 'MISCONFIGURED_CLIENT',
@@ -221,6 +299,7 @@ const handleCallback = async (request, env) => {
   if (provider === 'gitlab') {
     if (!GITLAB_CLIENT_ID || !GITLAB_CLIENT_SECRET) {
       return outputHTML({
+        allowedDomains,
         provider,
         error: 'OAuth app client ID or secret is not configured.',
         errorCode: 'MISCONFIGURED_CLIENT',
@@ -256,6 +335,7 @@ const handleCallback = async (request, env) => {
 
   if (!response) {
     return outputHTML({
+      allowedDomains,
       provider,
       error: 'Failed to request an access token. Please try again later.',
       errorCode: 'TOKEN_REQUEST_FAILED',
@@ -266,13 +346,14 @@ const handleCallback = async (request, env) => {
     ({ access_token: token, error } = await response.json());
   } catch {
     return outputHTML({
+      allowedDomains,
       provider,
       error: 'Server responded with malformed data. Please try again later.',
       errorCode: 'MALFORMED_RESPONSE',
     });
   }
 
-  return outputHTML({ provider, token, error });
+  return outputHTML({ provider, token, error, allowedDomains });
 };
 
 export default {
