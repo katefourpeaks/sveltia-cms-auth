@@ -77,8 +77,8 @@ const outputHTML = ({ provider = 'unknown', token, error, errorCode, allowedDoma
     `
       <!doctype html><html><body><script>
         (() => {
-          const allowedPatterns = ${JSON.stringify(allowedPatterns)};
-          const allowedOrigins = ${JSON.stringify(allowedOrigins)};
+          const allowedPatterns = ${JSON.stringify(allowedPatterns).replaceAll('<', '\\u003c')};
+          const allowedOrigins = ${JSON.stringify(allowedOrigins).replaceAll('<', '\\u003c')};
 
           window.addEventListener('message', ({ data, origin }) => {
             let hostname = '';
@@ -94,7 +94,7 @@ const outputHTML = ({ provider = 'unknown', token, error, errorCode, allowedDoma
               allowedPatterns.some((pattern) => new RegExp(pattern).test(hostname))
             ) {
               window.opener?.postMessage(
-                'authorization:${provider}:${state}:${JSON.stringify(content)}',
+                'authorization:${provider}:${state}:${JSON.stringify(content).replaceAll('<', '\\u003c')}',
                 origin
               );
             }
